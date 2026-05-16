@@ -6,6 +6,9 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <fstream>
+#include <fcntl.h>
+#include <cctype>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <cstring>
@@ -42,6 +45,7 @@ struct Game {
 
     std::atomic<bool>   is_installed      { false };
     std::atomic<bool>   is_downloading    { false };
+    std::atomic<bool>   is_launching      { false };
     std::atomic<float>  download_progress { 0.0f  };
 
     mutable std::mutex  error_mtx;
@@ -59,6 +63,11 @@ struct Game {
     std::string get_effective_install_path() const {
         if (strlen(custom_install_path) > 0) return std::string(custom_install_path);
         return default_install_root + folder_name;
+    }
+
+    std::string get_log_path() const {
+        const char* home = getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/.local/share/stf/logs/" + std::to_string(id) + ".log";
     }
 };
 
@@ -176,12 +185,20 @@ bool AttemptServerLogin(const std::string& username, const std::string& password
 }
 
 // --- Launch a game using fork/exec (no shell injection) ---
-void LaunchGameNative(GamePtr game) {
+void LaunchGameInternal(GamePtr game) {
+    game->is_launching = true;
     std::string game_dir = game->get_effective_install_path();
     std::string target_exe = game->detected_exe; // Try using cached path first
 
+    if (game->folder_name.empty() && strlen(game->custom_install_path) == 0) {
+        std::cerr << "[launcher] Invalid game path configuration." << std::endl;
+        game->is_launching = false;
+        return;
+    }
+
     if (!fs::exists(game_dir)) {
         std::cerr << "[launcher] Game directory not found: " << game_dir << std::endl;
+        game->is_launching = false;
         return;
     }
 
@@ -196,13 +213,17 @@ void LaunchGameNative(GamePtr game) {
             bool is_bin  = (ext == ".x86_64" || ext == ".bin" || ext == ".sh" ||
                             ext == ".x86"  || ext == ".amd64");
 
-            if (!is_exe && !is_bin) continue;
+            std::string path_str = entry.path().string();
+            if ((!is_exe && !is_bin) || path_str.find("CMakeFiles") != std::string::npos) continue;
 
             std::string stem = entry.path().stem().string();
             std::string stem_lower;
             for (char c : stem) stem_lower += static_cast<char>(std::tolower(c));
 
             if (stem_lower.find("unity") != std::string::npos || 
+                stem_lower.find("setup") != std::string::npos ||
+                stem_lower.find("install") != std::string::npos ||
+                stem_lower.find("redist") != std::string::npos ||
                 stem_lower.find("crash") != std::string::npos ||
                 stem_lower.find("uninstall") != std::string::npos) continue;
 
@@ -218,66 +239,45 @@ void LaunchGameNative(GamePtr game) {
     }
 
     if (target_exe.empty()) {
-        // Last resort: list what we found for debugging
-        std::cerr << "[launcher] No executable found in: " << game_dir << std::endl;
-        std::cerr << "[launcher] Contents:" << std::endl;
-        for (const auto& entry : fs::recursive_directory_iterator(game_dir)) {
-            std::cerr << "  " << entry.path().string()
-                      << (entry.is_directory() ? "/" : "") << std::endl;
-        }
+        game->is_launching = false;
         return;
     }
 
-    std::cout << "[launcher] Launching: " << target_exe << std::endl;
-
-    // Force executable permissions
-    try {
-        fs::permissions(target_exe,
-                        fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
-                        fs::perm_options::add);
-    } catch (const std::exception& e) {
-        std::cerr << "Failed setting permissions: " << e.what() << std::endl;
-    }
-
+    // Prepare all data in parent before forking (unsafe to do complex logic in child)
     std::string exe_dir = fs::absolute(fs::path(target_exe).parent_path()).string();
     std::string ext = fs::path(target_exe).extension().string();
     bool is_wine = (ext == ".exe" || ext == ".EXE");
 
+    const char* home = getenv("HOME");
+    std::string hosts_path = std::string(home ? home : "/tmp") + "/.local/share/stf/hosts";
+    std::string log_path = game->get_log_path();
+    std::string shell_cmd = "mount --bind " + hosts_path + " /etc/hosts && exec wine \"" + target_exe + "\"";
+
+    if (is_wine) {
+        fs::create_directories(fs::path(hosts_path).parent_path());
+        std::ofstream hf(hosts_path);
+        hf << "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n";
+    }
+
+    std::cout << "[launcher] Launching: " << target_exe << std::endl;
+
     pid_t pid = fork();
     if (pid == 0) {
+        // Child process: perform minimal async-signal-safe operations
         setsid();
         chdir(exe_dir.c_str());
         setenv("WINEDEBUG", "-all", 1);  // suppress all Wine debug spam
 
+        // Redirect output to log file
+        int log_fd = open(log_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (log_fd >= 0) {
+            dup2(log_fd, STDIN_FILENO);
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+
         if (is_wine) {
-            // Build a custom hosts file so Wine's getaddrinfo doesn't fail
-            const char* home = getenv("HOME");
-            if (!home) home = "/tmp";
-            std::string hosts_path = std::string(home) + "/.local/share/stf/hosts";
-            fs::create_directories(fs::path(hosts_path).parent_path());
-
-            std::string hn = "localhost";
-            if (const char* e = getenv("HOSTNAME")) hn = e;
-
-            {
-                std::ofstream hf(hosts_path);
-                hf << "127.0.0.1 localhost\n"
-                   << "127.0.1.1 " << hn << "\n"
-                   << "::1 localhost ip6-localhost ip6-loopback\n";
-            }
-
-            // Redirect stdin/stdout/stderr to /dev/null (no terminal window)
-            int devnull = open("/dev/null", O_RDWR);
-            if (devnull >= 0) {
-                dup2(devnull, STDIN_FILENO);
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                if (devnull > STDERR_FILENO) close(devnull);
-            }
-
-            // Try unshare (no-root user namespace + bind-mount custom hosts)
-            std::string shell_cmd = "mount --bind " + hosts_path
-                + " /etc/hosts && exec wine \"" + target_exe + "\"";
             execlp("unshare", "unshare", "--user", "--map-root-user",
                    "--mount", "--mount-proc",
                    "sh", "-c", shell_cmd.c_str(),
@@ -298,6 +298,7 @@ void LaunchGameNative(GamePtr game) {
     } else if (pid < 0) {
         std::cerr << "Fork failed for game launch: " << std::strerror(errno) << std::endl;
     }
+    game->is_launching = false;
 }
 
 // --- Download a game archive and extract it (runs in its own thread) ---
@@ -555,9 +556,29 @@ void RenderSteamRIPUI() {
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                                       ImVec4(0.15f, 0.50f, 0.25f, 1.00f));
 
-                if (ImGui::Button(("LAUNCH GAME##" + std::to_string(game->id)).c_str(),
-                                   ImVec2(-1, 42))) {
-                    LaunchGameNative(game);
+                if (game->is_launching) {
+                    ImGui::Button(("LAUNCHING...##" + std::to_string(game->id)).c_str(), ImVec2(-1, 42));
+                } else {
+                    if (ImGui::Button(("LAUNCH GAME##" + std::to_string(game->id)).c_str(),
+                                       ImVec2(-1, 42))) {
+                        game->is_launching = true;
+                        // Launch in a background thread to keep the UI responsive during executable search
+                        std::thread([game]() { LaunchGameInternal(game); }).detach();
+                    }
+                }
+
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("View Wine Logs")) {
+                        std::string log_path = game->get_log_path();
+                        if (fs::exists(log_path)) {
+                            std::string cmd = "xdg-open " + log_path + " &";
+                            system(cmd.c_str());
+                        }
+                    }
+                    if (ImGui::MenuItem("Clear Logs")) {
+                        if (fs::exists(game->get_log_path())) fs::remove(game->get_log_path());
+                    }
+                    ImGui::EndPopup();
                 }
                 ImGui::PopStyleColor(3);
             }
@@ -569,8 +590,11 @@ void RenderSteamRIPUI() {
                 ImGui::PopStyleColor(1);
 
                 ImGui::Spacing();
+                float progress = game->download_progress.load();
+                char progress_text[32];
+                snprintf(progress_text, sizeof(progress_text), "%d%%", (int)(progress * 100));
                 ImGui::PushStyleColor(ImGuiCol_PlotHistogram, AccentBlue);
-                ImGui::ProgressBar(game->download_progress.load(), ImVec2(-1, 4), "");
+                ImGui::ProgressBar(progress, ImVec2(-1, 0), progress_text);
                 ImGui::PopStyleColor(1);
 
                 std::string err = game->get_error();
@@ -609,6 +633,11 @@ void RenderSteamRIPUI() {
 int main() {
     // Initialise libcurl globally (required before any curl_easy_init call)
     curl_global_init(CURL_GLOBAL_ALL);
+
+    // Create logs directory
+    const char* home = getenv("HOME");
+    std::string log_dir = std::string(home ? home : "/tmp") + "/.local/share/stf/logs/";
+    fs::create_directories(log_dir);
 
     if (!glfwInit()) {
         curl_global_cleanup();
