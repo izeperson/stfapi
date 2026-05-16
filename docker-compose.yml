@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  game-server:
+    build: .
+    container_name: stf-game-server
+    ports:
+      - "35061:35061"
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
